@@ -1,13 +1,13 @@
-# Training.jl (Mit Ladefunktion für Snapshots)
+# Training.jl (With Discard Pile and History)
 
 module Training
 
-# Importiere Spiellogik und Aktionsraum-Mapping
+# Import game logic and action space mapping
 using ..HanabiLogic
 include("ActionSpace.jl")
 using .ActionSpace
 
-# Importiere benötigte Pakete
+# Import required packages
 using Flux
 using CUDA
 using MLUtils
@@ -20,14 +20,15 @@ using Crayons
 using Printf
 using Distributions: Categorical
 
-# Konfigurationskonstanten
+# ... (Most of the file is unchanged until INPUT_CHANNELS) ...
+# Configuration constants
 const NUM_ACTIONS = 20
-const INPUT_CHANNELS = 14
+const INPUT_CHANNELS = 29 # CHANGED: 14 (base) + 5 (discard) + 10 (history)
 const BATCH_SIZE = 128
-const TRAINING_ITERATIONS = 1000
-const GAMES_PER_ITERATION = 50
+const TRAINING_ITERATIONS = 10000
+const GAMES_PER_ITERATION = 200
 const STEPS_PER_ITERATION = 500
-const MCTS_SIMULATIONS = 100
+const MCTS_SIMULATIONS = 200
 const SNAPSHOT_DIR = "snapshots"
 const MIN_BUFFER_FILL = BATCH_SIZE * 10
 
@@ -57,6 +58,7 @@ end
 struct AIPlayer <: AbstractPlayer
     model::HanabiNet
 end
+export AIPlayer
 struct TrainingSample
     state::Array{Float32, 3}
     policy_target::Vector{Float32}
@@ -64,8 +66,16 @@ struct TrainingSample
 end
 const REPLAY_BUFFER = CircularBuffer{TrainingSample}(100_000)
 const BUFFER_LOCK = ReentrantLock()
+
+# ########################################################################## #
+# #################### MODIFIED SECTION START ############################## #
+# ########################################################################## #
+
 function encode_state(player_view::PlayerView)::Array{Float32, 3}
-    board = zeros(Float32, 5, 5, 14)
+    board = zeros(Float32, 5, 5, INPUT_CHANNELS)
+
+    # --- Channels 1-14: Original State Representation ---
+    # My hand knowledge (Channels 1-10)
     for i in 1:player_view.my_hand_size
         if player_view.my_knowledge[i].is_color_known
             color = Int(log2(player_view.my_knowledge[i].possible_colors)) + 1
@@ -76,20 +86,55 @@ function encode_state(player_view::PlayerView)::Array{Float32, 3}
             board[i, 2, 5 + rank] = 1.0f0
         end
     end
+    # Partner's hand (Channels 11-12)
     partner_hand = player_view.other_player_hands[1]
     for (i, card_id) in enumerate(partner_hand)
         card = CANONICAL_DECK[card_id + 1]
         board[i, 3, 11] = card.color / 5.0f0
         board[i, 4, 12] = card.rank / 5.0f0
     end
+    # Fireworks (Channel 13)
     for c in 1:NUM_COLORS
         board[c, 5, 13] = player_view.fireworks[c] / 5.0f0
     end
+    # Game state scalars (Channel 14)
     board[1, 5, 14] = player_view.clue_tokens / CLUE_TOKENS_MAX
     board[2, 5, 14] = player_view.error_tokens / ERROR_TOKENS_MAX
     board[3, 5, 14] = player_view.deck_size / 50.0f0
+
+    # --- Channels 15-19: Discard Pile ---
+    discard_counts = zeros(Int, 5, 5) # rank, color
+    for card_id in player_view.discard_pile
+        card = CANONICAL_DECK[card_id + 1]
+        discard_counts[card.rank, card.color] += 1
+    end
+    for color in 1:NUM_COLORS
+        for rank in 1:5
+            # Normalize by total number of cards of that rank
+            board[rank, 1, 14 + color] = discard_counts[rank, color] / RANKS[rank]
+        end
+    end
+
+    # --- Channels 20-29: Last 10 Moves ---
+    last_10_actions = last(player_view.history, 10)
+    for (i, action) in enumerate(last_10_actions)
+        channel_idx = 19 + i
+        action_idx = action_to_index(action)
+        if action_idx > 0
+            # One-hot encode the action on a 5x5 grid
+            row = (action_idx - 1) % 5 + 1
+            col = (action_idx - 1) ÷ 5 + 1
+            board[row, col, channel_idx] = 1.0f0
+        end
+    end
+
     return board
 end
+
+# ########################################################################## #
+# #################### MODIFIED SECTION END ################################ #
+# ########################################################################## #
+
 
 #SECTION: MCTS Implementation
 mutable struct MCTSNode
@@ -225,14 +270,12 @@ function self_play_worker(model::HanabiNet, games_to_play::Int)
     end
     return total_score / games_to_play
 end
-
 function loss(model, state, policy_target, value_target)
     policy_logits, value_pred = model(state)
     value_loss = Flux.mse(value_pred, value_target)
     policy_loss = Flux.logitcrossentropy(policy_logits, policy_target)
     return value_loss + policy_loss
 end
-
 function training_worker(model::HanabiNet, opt, training_steps::Int, batch_size::Int)
     if length(REPLAY_BUFFER) < MIN_BUFFER_FILL return model, -1.0f0 end
     final_loss = 0.0f0
@@ -305,7 +348,6 @@ function run_training_loop()
     
     opt = Flux.setup(Adam(1e-4), model)
 
-    println("Starting Hanabi Training Loop with MCTS...")
     @printf("%-5s | %-15s | %-12s | %-15s | %-15s\n", "Iter", "Avg SP Score", "Final Loss", "Avg Eval Score", "Buffer Size")
     println("-"^70)
     
@@ -315,7 +357,7 @@ function run_training_loop()
         
         loss_display = final_loss < 0 ? "N/A" : @sprintf("%.4f", final_loss)
 
-        avg_eval_score = evaluate_model(model, 5)
+        avg_eval_score = evaluate_model(model, 20)
         @printf("%-5d | %-15.2f | %-12s | %-15.2f | %-15s\n",
                  iter, avg_sp_score, loss_display, avg_eval_score,
                  "$(length(REPLAY_BUFFER))/$(DataStructures.capacity(REPLAY_BUFFER))")
