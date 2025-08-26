@@ -225,12 +225,14 @@ function self_play_worker(model::HanabiNet, games_to_play::Int)
     end
     return total_score / games_to_play
 end
+
 function loss(model, state, policy_target, value_target)
     policy_logits, value_pred = model(state)
     value_loss = Flux.mse(value_pred, value_target)
     policy_loss = Flux.logitcrossentropy(policy_logits, policy_target)
     return value_loss + policy_loss
 end
+
 function training_worker(model::HanabiNet, opt, training_steps::Int, batch_size::Int)
     if length(REPLAY_BUFFER) < MIN_BUFFER_FILL return model, -1.0f0 end
     final_loss = 0.0f0
