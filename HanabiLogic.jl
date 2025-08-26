@@ -5,7 +5,7 @@ module HanabiLogic
 using Crayons
 using Random
 
-export GameState, PlayerView, AbstractPlayer, RandomPlayer, simulate_game, render, Action
+export GameState, PlayerView, AbstractPlayer, RandomPlayer, simulate_game, render, Action, setup_game, is_game_over, get_player_view, get_legal_actions, CANONICAL_DECK, NUM_COLORS, CLUE_TOKENS_MAX, ERROR_TOKENS_MAX, apply_action!, get_score, NUM_PLAYERS
 
 #SECTION: Core Types and Constants
 
